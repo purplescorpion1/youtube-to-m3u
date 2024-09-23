@@ -3,7 +3,8 @@ Play YouTube live streams in any player
 
 ## Requirements
 python <br>
-streamlink (available at path)
+flask (can be installed by doing pip install flask)
+[streamlink](https://streamlink.github.io/install.html) (available at path )
 
 ## How To Use
 Open youtubelive.m3u <br>
