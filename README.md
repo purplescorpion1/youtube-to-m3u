@@ -8,6 +8,7 @@ streamlink (available at path)
 ## How To Use
 Open youtubelive.m3u <br>
 Change the ip address in the streamlink to the ip address of the machine running the script <br>
+You can also change the port but if you do this you must change the port to match at the bottom of youtube-live.py <br>
 <br>
 To add other live streams just add into m3u in the following format 
 
