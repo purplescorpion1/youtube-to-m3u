@@ -18,6 +18,8 @@ To add other live streams just add into m3u in the following format
 http://192.168.1.123:6095/stream?url=https://www.youtube.com/@ChannelName/live
 ```
 
+Or if the channel has multiple live streams you can use the /watch? link <br>
+<br>
 You can change tvg-name tvg-logo group-title and channel name and if you want to link to an epg change tvg-id to match your epgs tvg-id for that channel <br>
 (The two sample streams link to the epg from epgshare01.online UK and USA epgs) <br>
 <br>
