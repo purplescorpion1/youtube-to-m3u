@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:-1 tvg-name="ABC News" tvg-id="ABCNEWS.us" tvg-logo="https://github.com/tv-logo/tv-logos/blob/main/countries/united-states/abc-news-light-us.png?raw=true" group-title="News",ABC News
+http://192.168.1.123:6095/stream?url=https://www.youtube.com/@abcnews/live
+#EXTINF:-1 tvg-name="GB News" tvg-id="GB.News.HD.uk" tvg-logo="https://github.com/tv-logo/tv-logos/blob/main/countries/united-kingdom/gb-news-uk.png?raw=true" group-title="News",GB News
+http://192.168.1.123:6095/stream?url=https://www.youtube.com/@GBNewsOnline/live
