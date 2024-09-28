@@ -5,8 +5,8 @@ from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
+# Set up logging to only show warnings and errors
+logging.basicConfig(level=logging.WARNING)
 
 @app.route('/stream', methods=['GET'])
 def stream():
@@ -26,7 +26,6 @@ def stream():
 
         # Parse the JSON output
         stream_info = json.loads(info_output)
-        logging.debug(f'Stream info: {stream_info}')
 
         # Determine the best quality available
         best_quality = stream_info['streams'].get('best')
@@ -42,8 +41,6 @@ def stream():
             '--stdout'
         ]
 
-        logging.debug(f'Running command: {" ".join(command)}')
-
         # Create a subprocess to run Streamlink and stream output
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -52,7 +49,6 @@ def stream():
                 data = process.stdout.read(4096)
                 if not data:
                     break
-                logging.debug(f'Sending data: {data[:50]}...')  # Log only the first 50 bytes
                 yield data
 
             process.stdout.close()
