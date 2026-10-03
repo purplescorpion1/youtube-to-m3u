@@ -1,340 +1,1255 @@
-import xml.etree.ElementTree as ET
+#!/usr/bin/env python3
+"""
+Standalone YouTube live stream extractor.
+
+Generates an M3U playlist from youtubelinks.xml without requiring Streamlink.
+
+The extraction process follows the same general approach as the working
+Streamlink YouTube plugin:
+
+    YouTube channel/live page
+        |
+        +--> handle consent redirect if required
+        |
+        +--> resolve current live video ID
+        |
+        +--> YouTube InnerTube player API
+        |
+        +--> streamingData.hlsManifestUrl
+        |
+        +--> M3U playlist
+
+Requirements:
+    pip install requests
+
+Streamlink is NOT required.
+"""
+
+import html
+import json
 import logging
 import re
-import requests
-import json
-from urllib.parse import urlparse, parse_qs
+import xml.etree.ElementTree as ET
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+import requests
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 INPUT_XML = "youtubelinks.xml"
 OUTPUT_M3U = "youtube_output.m3u"
 
+DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
-# ------------------------------------------------------------
-# Parse XML
-# ------------------------------------------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) "
+    "Gecko/20100101 Firefox/157.0"
+)
+
+# Same InnerTube client configuration used by youtube.py
+ANDROID_CLIENT = {
+    "clientName": "ANDROID",
+    "clientVersion": "21.08.266",
+    "platform": "DESKTOP",
+    "clientScreen": "EMBED",
+    "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+    "browserName": "Chrome",
+    "hl": "en",
+    "gl": "US",
+}
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+# ============================================================
+# XML
+# ============================================================
+
 def parse_xml(file_path):
     tree = ET.parse(file_path)
     root = tree.getroot()
+
     channels = []
+
     for ch in root.findall("channel"):
         channels.append({
             "name": ch.findtext("channel-name", "").strip(),
             "tvg-id": ch.findtext("tvg-id", "").strip(),
             "tvg-name": ch.findtext("tvg-name", "").strip(),
             "tvg-logo": ch.findtext("tvg-logo", "").strip(),
-            "group-title": ch.findtext("group-title", "General").strip(),
-            "youtube-url": ch.findtext("youtube-url", "").strip(),
+            "group-title": ch.findtext(
+                "group-title",
+                "General",
+            ).strip(),
+            "youtube-url": ch.findtext(
+                "youtube-url",
+                "",
+            ).strip(),
         })
+
     return channels
 
 
-# ------------------------------------------------------------
-# Normalize URL formats
-# ------------------------------------------------------------
-def normalize_url(url):
-    parsed = urlparse(url)
+# ============================================================
+# VIDEO ID EXTRACTION
+# ============================================================
 
-    if parsed.netloc.startswith("m."):
-        url = url.replace("m.youtube.com", "www.youtube.com")
+def extract_video_id_from_url(url):
+    """
+    Extract an 11-character YouTube video ID from a URL.
+    """
 
-    if parsed.netloc == "youtu.be":
-        vid = parsed.path.strip("/")
-        if len(vid) == 11:
-            return f"https://www.youtube.com/watch?v={vid}"
-
-    m = re.match(r"^/shorts/([\w-]{11})", parsed.path)
-    if m:
-        return f"https://www.youtube.com/watch?v={m.group(1)}"
-
-    m = re.match(r"^/embed/([\w-]{11})", parsed.path)
-    if m:
-        return f"https://www.youtube.com/watch?v={m.group(1)}"
-
-    return url
-
-
-# ------------------------------------------------------------
-# Recursive search in ytInitialData
-# ------------------------------------------------------------
-def search_video_id(data):
-    if isinstance(data, dict):
-        if "videoRenderer" in data:
-            vr = data["videoRenderer"]
-            if "videoId" in vr:
-                return vr["videoId"]
-        for v in data.values():
-            r = search_video_id(v)
-            if r:
-                return r
-    elif isinstance(data, list):
-        for item in data:
-            r = search_video_id(item)
-            if r:
-                return r
-    return None
-
-
-# ------------------------------------------------------------
-# Extract Video ID (consent bypass regex fixed)
-# ------------------------------------------------------------
-def get_video_id(session, url):
-
-    url = normalize_url(url)
-    parsed = urlparse(url)
-
-    # Direct watch?v= format
-    if parsed.path == "/watch":
-        qs = parse_qs(parsed.query)
-        if "v" in qs:
-            logging.info("Video ID extracted from watch URL")
-            return qs["v"][0]
-
-    # /live/VIDEOID format
-    m = re.match(r"^/live/([\w-]{11})", parsed.path)
-    if m:
-        logging.info("Video ID extracted from /live/ path")
-        return m.group(1)
-
-    logging.info(f"Fetching page: {url}")
-
-    try:
-        r = session.get(url, timeout=20, allow_redirects=True)
-        r.raise_for_status()
-    except Exception as e:
-        logging.error(f"Fetch failed: {e}")
+    if not url:
         return None
 
-    html = r.text
-    final_url = r.url
+    patterns = [
+        r"(?:[?&]v=|/live/|/embed/|/v/|youtu\.be/)"
+        r"([A-Za-z0-9_-]{11})(?:[?&#/]|$)",
 
-    # Detect and bypass consent page
-    if "consent.youtube.com" in final_url or "Manage your YouTube cookies" in html or "CONSENT" in html.upper():
-        logging.info("Detected consent page - attempting to bypass")
+        r"/shorts/"
+        r"([A-Za-z0-9_-]{11})(?:[?&#/]|$)",
+    ]
 
-        # FIXED regex: safer capture to avoid unbalanced paren issues
-        accept_match = re.search(
-            r'href\s*=\s*"([^"]*consent\.youtube\.com/save\?[^"]*)"',
-            html,
-            re.IGNORECASE | re.DOTALL
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            url,
+            re.IGNORECASE,
         )
-        if accept_match:
-            accept_url = accept_match.group(1)
-            logging.info(f"Following consent accept link: {accept_url}")
-            try:
-                r = session.get(accept_url, timeout=20, allow_redirects=True)
-                html = r.text
-                final_url = r.url
-                logging.info(f"After consent bypass, landed at: {final_url}")
-            except Exception as e:
-                logging.warning(f"Consent accept follow failed: {e}")
-        else:
-            # Fallback: set common consent cookies manually
-            logging.info("No accept link found - setting consent cookies manually")
-            session.cookies.set(
-                "SOCS", "CAESEwgDEgk0MjAxMjA3MTEaAmVuIAEaBgiA_7GfBg",
-                domain=".youtube.com", path="/"
-            )
-            session.cookies.set(
-                "CONSENT", "YES+srp.gws-20211028-0-RC1.en+FX+123",
-                domain=".youtube.com", path="/"
-            )
-            # Retry original URL with cookies
-            try:
-                r = session.get(url, timeout=20, allow_redirects=True)
-                html = r.text
-                final_url = r.url
-                logging.info(f"After setting cookies, final URL: {final_url}")
-            except Exception as e:
-                logging.warning(f"Retry after cookie set failed: {e}")
 
-    # Now try to extract video ID from (hopefully) real page
-    # 1. Canonical link (best for /@handle/live pages)
-    m_canonical = re.search(
-        r'<link\s+rel=["\']canonical["\']\s+href=["\']https?://(?:www\.)?youtube\.com/watch\?v=([\w-]{11})["\']',
-        html,
-        re.IGNORECASE
-    )
-    if m_canonical:
-        vid = m_canonical.group(1)
-        logging.info("Video ID extracted from canonical <link> tag")
-        return vid
+        if match:
+            return match.group(1)
 
-    # 2. og:url meta tag fallback
-    m_og = re.search(
-        r'<meta\s+property=["\']og:url["\']\s+content=["\'](.*?)["\']',
-        html,
-        re.IGNORECASE | re.DOTALL
-    )
-    if m_og:
-        og_url = m_og.group(1)
-        parsed_og = urlparse(og_url)
-        qs = parse_qs(parsed_og.query)
-        if "v" in qs and len(qs["v"][0]) == 11:
-            vid = qs["v"][0]
-            logging.info("Video ID extracted from og:url meta tag")
-            return vid
-
-    # 3. Strong global search for videoId
-    match = re.search(r'"videoId"\s*:\s*"([\w-]{11})"', html)
-    if match:
-        logging.info("Video ID extracted from page source (videoId JSON)")
-        return match.group(1)
-
-    # 4. ytInitialData fallback
-    match = re.search(
-        r'var\s+ytInitialData\s*=\s*({.*?})\s*;\s*</script>',
-        html,
-        re.DOTALL
-    )
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            vid = search_video_id(data)
-            if vid:
-                logging.info("Video ID extracted from ytInitialData")
-                return vid
-        except Exception:
-            pass
-
-    # 5. Check if finally redirected to /watch
-    if final_url != url:
-        logging.info(f"Final page is: {final_url}")
-        parsed_final = urlparse(final_url)
-        if parsed_final.path == "/watch":
-            qs = parse_qs(parsed_final.query)
-            if "v" in qs:
-                logging.info("Video ID extracted from final redirected watch URL")
-                return qs["v"][0]
-
-    logging.warning("No video ID found after all attempts")
     return None
 
 
-# ------------------------------------------------------------
-# Extract visitorData
-# ------------------------------------------------------------
-def get_visitor_data(html):
-    m = re.search(r'"visitorData"\s*:\s*"([^"]+)"', html)
-    return m.group(1) if m else None
+def extract_canonical_video_id(page):
+    """
+    Find a canonical YouTube watch URL.
+
+    The working Streamlink plugin validates the canonical link and extracts
+    the video ID from it. We deliberately search more flexibly here because
+    the ordering of rel/href attributes can change.
+    """
+
+    if not page:
+        return None
+
+    page = html.unescape(page)
+    page = page.replace("\\/", "/")
+
+    # --------------------------------------------------------
+    # First: actual canonical <link>
+    # --------------------------------------------------------
+
+    link_tags = re.findall(
+        r"<link\b[^>]*>",
+        page,
+        re.IGNORECASE,
+    )
+
+    for tag in link_tags:
+
+        if not re.search(
+            r'\brel\s*=\s*["\']canonical["\']',
+            tag,
+            re.IGNORECASE,
+        ):
+            continue
+
+        match = re.search(
+            r'\bhref\s*=\s*["\']([^"\']+)["\']',
+            tag,
+            re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        href = match.group(1)
+
+        video_id = extract_video_id_from_url(
+            href
+        )
+
+        if video_id:
+            return video_id
+
+    # --------------------------------------------------------
+    # Second: any YouTube watch URL in page
+    # --------------------------------------------------------
+
+    match = re.search(
+        r'https?://(?:www\.)?youtube\.com/watch\?v='
+        r'([A-Za-z0-9_-]{11})',
+        page,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1)
+
+    # --------------------------------------------------------
+    # Third: escaped watch URL
+    # --------------------------------------------------------
+
+    match = re.search(
+        r'https?:\\/\\/(?:www\.)?youtube\.com\\/watch\?v='
+        r'([A-Za-z0-9_-]{11})',
+        page,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
 
 
-# ------------------------------------------------------------
-# Extract HLS via InnerTube
-# ------------------------------------------------------------
-def extract_youtube_stream(youtube_url):
+# ============================================================
+# JAVASCRIPT JSON EXTRACTION
+# ============================================================
+
+def extract_json_assignment(page, variable_name):
+    """
+    Extract a JavaScript object assigned to a variable such as:
+
+        var ytInitialData = {...};
+
+    or:
+
+        var ytInitialPlayerResponse = {...};
+    """
+
+    if not page:
+        return None
+
+    pattern = re.compile(
+        rf"(?:var\s+)?{re.escape(variable_name)}"
+        rf"\s*=\s*",
+        re.IGNORECASE,
+    )
+
+    match = pattern.search(page)
+
+    if not match:
+        return None
+
+    start = page.find(
+        "{",
+        match.end(),
+    )
+
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for i in range(
+        start,
+        len(page),
+    ):
+
+        char = page[i]
+
+        if in_string:
+
+            if escaped:
+                escaped = False
+
+            elif char == "\\":
+                escaped = True
+
+            elif char == '"':
+                in_string = False
+
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "{":
+            depth += 1
+
+        elif char == "}":
+
+            depth -= 1
+
+            if depth == 0:
+
+                raw_json = page[
+                    start:i + 1
+                ]
+
+                try:
+                    return json.loads(
+                        raw_json
+                    )
+
+                except json.JSONDecodeError:
+                    return None
+
+    return None
+
+
+def find_video_id_in_player_response(page):
+    """
+    Look specifically inside ytInitialPlayerResponse.
+    """
+
+    data = extract_json_assignment(
+        page,
+        "ytInitialPlayerResponse",
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    video_details = data.get(
+        "videoDetails"
+    )
+
+    if not isinstance(
+        video_details,
+        dict,
+    ):
+        return None
+
+    video_id = video_details.get(
+        "videoId"
+    )
+
+    if (
+        isinstance(video_id, str)
+        and re.fullmatch(
+            r"[A-Za-z0-9_-]{11}",
+            video_id,
+        )
+    ):
+        return video_id
+
+    return None
+
+
+def find_video_id_in_initial_data(page):
+    """
+    Search ytInitialData.
+
+    This follows the same renderer types used by youtube.py:
+
+        videoRenderer
+        gridVideoRenderer
+    """
+
+    data = extract_json_assignment(
+        page,
+        "ytInitialData",
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    def walk(value):
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            for renderer_name in (
+                "videoRenderer",
+                "gridVideoRenderer",
+            ):
+
+                renderer = value.get(
+                    renderer_name
+                )
+
+                if isinstance(
+                    renderer,
+                    dict,
+                ):
+
+                    video_id = renderer.get(
+                        "videoId"
+                    )
+
+                    if (
+                        isinstance(
+                            video_id,
+                            str,
+                        )
+                        and re.fullmatch(
+                            r"[A-Za-z0-9_-]{11}",
+                            video_id,
+                        )
+                    ):
+                        yield video_id
+
+            for child in value.values():
+                yield from walk(child)
+
+        elif isinstance(
+            value,
+            list,
+        ):
+
+            for child in value:
+                yield from walk(child)
+
+    for video_id in walk(data):
+        return video_id
+
+    return None
+
+
+def find_generic_video_id(page):
+    """
+    Last-resort search.
+
+    This is deliberately performed after the more reliable methods above.
+    """
+
+    if not page:
+        return None
+
+    patterns = [
+        r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"',
+        r"'videoId'\s*:\s*'([A-Za-z0-9_-]{11})'",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            page,
+        )
+
+        if match:
+            return match.group(1)
+
+    return None
+
+
+# ============================================================
+# CONSENT HANDLING
+# ============================================================
+
+def extract_consent_form(page):
+    """
+    Extract the consent form action and hidden fields.
+
+    This mirrors the behaviour of youtube.py's _get_res():
+
+        if final URL == consent.youtube.com
+            -> locate form
+            -> submit hidden fields
+            -> continue with YouTube response
+    """
+
+    if not page:
+        return None, {}
+
+    # Find consent form.
+    form_match = re.search(
+        r"<form\b([^>]*)>(.*?)</form>",
+        page,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    if not form_match:
+        return None, {}
+
+    form_attributes = form_match.group(1)
+    form_body = form_match.group(2)
+
+    action_match = re.search(
+        r'\baction\s*=\s*["\']([^"\']+)["\']',
+        form_attributes,
+        re.IGNORECASE,
+    )
+
+    if not action_match:
+        return None, {}
+
+    action = html.unescape(
+        action_match.group(1)
+    )
+
+    if action.startswith("/"):
+        action = (
+            "https://consent.youtube.com"
+            + action
+        )
+
+    fields = {}
+
+    for input_match in re.finditer(
+        r"<input\b([^>]*)>",
+        form_body,
+        re.IGNORECASE | re.DOTALL,
+    ):
+
+        attributes = input_match.group(1)
+
+        name_match = re.search(
+            r'\bname\s*=\s*["\']([^"\']+)["\']',
+            attributes,
+            re.IGNORECASE,
+        )
+
+        if not name_match:
+            continue
+
+        value_match = re.search(
+            r'\bvalue\s*=\s*["\']([^"\']*)["\']',
+            attributes,
+            re.IGNORECASE,
+        )
+
+        name = html.unescape(
+            name_match.group(1)
+        )
+
+        value = ""
+
+        if value_match:
+            value = html.unescape(
+                value_match.group(1)
+            )
+
+        fields[name] = value
+
+    return action, fields
+
+
+def handle_consent(
+    session,
+    response,
+):
+    """
+    If YouTube redirected us to consent.youtube.com, submit the consent
+    form and return the resulting YouTube response.
+    """
+
+    if response is None:
+        return None
+
+    current_url = response.url.lower()
+
+    if "consent.youtube.com" not in current_url:
+        return response
+
+    logging.info(
+        "YouTube consent page detected - "
+        "submitting consent form"
+    )
+
+    action, fields = extract_consent_form(
+        response.text
+    )
+
+    if not action:
+        logging.warning(
+            "Could not find YouTube consent form"
+        )
+
+        return response
+
+    try:
+
+        consent_response = session.post(
+            action,
+            data=fields,
+            headers={
+                "Referer": response.url,
+            },
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        consent_response.raise_for_status()
+
+        logging.info(
+            "YouTube consent handled successfully"
+        )
+
+        return consent_response
+
+    except requests.RequestException as exc:
+
+        logging.warning(
+            f"Failed to submit YouTube consent: {exc}"
+        )
+
+        return response
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+def fetch_youtube_page(
+    session,
+    url,
+):
+    """
+    Fetch a YouTube page and handle consent redirects.
+    """
+
+    try:
+
+        response = session.get(
+            url,
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as exc:
+
+        logging.error(
+            f"Failed to fetch page: {exc}"
+        )
+
+        return None
+
+    # This is the important behaviour copied from youtube.py.
+    response = handle_consent(
+        session,
+        response,
+    )
+
+    return response
+
+
+# ============================================================
+# PAGE -> VIDEO ID
+# ============================================================
+
+def get_video_id_and_page(
+    session,
+    url,
+):
+    """
+    Resolve a YouTube URL into:
+
+        video_id, page_html
+    """
+
+    # --------------------------------------------------------
+    # Direct video URL
+    # --------------------------------------------------------
+
+    video_id = extract_video_id_from_url(
+        url
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Extracted video ID from URL: {video_id}"
+        )
+
+        watch_url = (
+            "https://www.youtube.com/watch?v="
+            + video_id
+        )
+
+        response = fetch_youtube_page(
+            session,
+            watch_url,
+        )
+
+        if response is not None:
+            return video_id, response.text
+
+        return video_id, None
+
+    # --------------------------------------------------------
+    # Channel / live page
+    # --------------------------------------------------------
+
+    logging.info(
+        f"Navigating to: {url}"
+    )
+
+    response = fetch_youtube_page(
+        session,
+        url,
+    )
+
+    if response is None:
+        return None, None
+
+    page = response.text
+
+    logging.debug(
+        f"Final YouTube page URL: {response.url}"
+    )
+
+    # --------------------------------------------------------
+    # 1. Did YouTube redirect us directly to a video?
+    # --------------------------------------------------------
+
+    video_id = extract_video_id_from_url(
+        response.url
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Resolved redirected URL to video ID: "
+            f"{video_id}"
+        )
+
+        return video_id, page
+
+    # --------------------------------------------------------
+    # 2. Canonical watch URL
+    #
+    # This is the method the working youtube.py relies on
+    # through _schema_canonical().
+    # --------------------------------------------------------
+
+    video_id = extract_canonical_video_id(
+        page
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Resolved canonical URL to video ID: "
+            f"{video_id}"
+        )
+
+        return video_id, page
+
+    # --------------------------------------------------------
+    # 3. ytInitialPlayerResponse
+    # --------------------------------------------------------
+
+    video_id = find_video_id_in_player_response(
+        page
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Resolved ytInitialPlayerResponse to "
+            f"video ID: {video_id}"
+        )
+
+        return video_id, page
+
+    # --------------------------------------------------------
+    # 4. ytInitialData
+    # --------------------------------------------------------
+
+    video_id = find_video_id_in_initial_data(
+        page
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Resolved ytInitialData to video ID: "
+            f"{video_id}"
+        )
+
+        return video_id, page
+
+    # --------------------------------------------------------
+    # 5. Generic videoId search
+    # --------------------------------------------------------
+
+    video_id = find_generic_video_id(
+        page
+    )
+
+    if video_id:
+
+        logging.info(
+            f"Resolved generic videoId to: "
+            f"{video_id}"
+        )
+
+        return video_id, page
+
+    # --------------------------------------------------------
+    # Nothing found
+    # --------------------------------------------------------
+
+    logging.warning(
+        "Could not resolve a live video ID "
+        "from channel page"
+    )
+
+    return None, page
+
+
+# ============================================================
+# API KEY / VISITOR DATA
+# ============================================================
+
+def extract_api_key(page):
+    """
+    Extract the current INNERTUBE_API_KEY.
+
+    Same approach as youtube.py, with its public key as fallback.
+    """
+
+    if page:
+
+        match = re.search(
+            r"""["']INNERTUBE_API_KEY["']\s*:\s*["']([^"']+)["']""",
+            page,
+        )
+
+        if match:
+            return match.group(1)
+
+    return DEFAULT_API_KEY
+
+
+def extract_visitor_data(page):
+    """
+    Extract visitorData if YouTube supplied it.
+    """
+
+    if not page:
+        return None
+
+    patterns = [
+        r"""["']visitorData["']\s*:\s*["']([^"']+)["']""",
+        r"""["']VISITOR_DATA["']\s*:\s*["']([^"']+)["']""",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            page,
+        )
+
+        if match:
+            return match.group(1)
+
+    return None
+
+
+# ============================================================
+# INNERTUBE PLAYER API
+# ============================================================
+
+def call_player_api(
+    session,
+    video_id,
+    api_key,
+    visitor_data=None,
+):
+    """
+    Call YouTube's InnerTube player endpoint.
+
+    This uses the same client context as youtube.py.
+    """
+
+    player_url = (
+        "https://www.youtube.com/youtubei/v1/player"
+    )
+
+    client = dict(
+        ANDROID_CLIENT
+    )
+
+    if visitor_data:
+        client["visitorData"] = visitor_data
+
+    payload = {
+        "videoId": video_id,
+        "contentCheckOk": True,
+        "racyCheckOk": True,
+        "context": {
+            "client": client,
+            "user": {
+                "lockedSafetyMode": "false",
+            },
+            "request": {
+                "useSsl": "true",
+            },
+        },
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.youtube.com",
+        "Referer": (
+            "https://www.youtube.com/watch?v="
+            + video_id
+        ),
+        "User-Agent": session.headers.get(
+            "User-Agent",
+            USER_AGENT,
+        ),
+    }
+
+    try:
+
+        response = session.post(
+            player_url,
+            params={
+                "key": api_key,
+            },
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.RequestException as exc:
+
+        logging.warning(
+            f"Player API request failed: {exc}"
+        )
+
+    except ValueError as exc:
+
+        logging.warning(
+            f"Player API returned invalid JSON: {exc}"
+        )
+
+    return None
+
+
+# ============================================================
+# HLS EXTRACTION
+# ============================================================
+
+def extract_hls_from_response(data):
+    """
+    Extract streamingData.hlsManifestUrl.
+    """
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return None
+
+    playability = (
+        data.get(
+            "playabilityStatus"
+        )
+        or {}
+    )
+
+    status = playability.get(
+        "status"
+    )
+
+    reason = playability.get(
+        "reason"
+    )
+
+    if status and status not in (
+        "OK",
+        "LIVE_STREAM_OFFLINE",
+    ):
+
+        logging.warning(
+            f"Playability status: {status}"
+            + (
+                f" - {reason}"
+                if reason
+                else ""
+            )
+        )
+
+        return None
+
+    streaming = (
+        data.get(
+            "streamingData"
+        )
+        or {}
+    )
+
+    # --------------------------------------------------------
+    # Normal live HLS manifest
+    # --------------------------------------------------------
+
+    hls = streaming.get(
+        "hlsManifestUrl"
+    )
+
+    if hls:
+        return hls
+
+    # --------------------------------------------------------
+    # Fallback hlsFormats
+    # --------------------------------------------------------
+
+    for fmt in (
+        streaming.get(
+            "hlsFormats"
+        )
+        or []
+    ):
+
+        if not isinstance(
+            fmt,
+            dict,
+        ):
+            continue
+
+        url = fmt.get(
+            "url"
+        )
+
+        if not url:
+            continue
+
+        if (
+            ".m3u8" in url.lower()
+            or "manifest" in url.lower()
+        ):
+            return url
+
+    return None
+
+
+# ============================================================
+# MAIN STREAM EXTRACTION
+# ============================================================
+
+def extract_youtube_stream(
+    youtube_url,
+):
+    """
+    Resolve a YouTube URL to an HLS stream URL.
+    """
 
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "User-Agent": USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Encoding": (
+            "gzip, deflate"
+        ),
+        "Connection": "keep-alive",
     })
 
-    video_id = get_video_id(session, youtube_url)
-    if not video_id:
-        logging.error("Could not resolve video ID")
-        return None
-
-    logging.info(f"Final video ID: {video_id}")
-
-    # Fetch watch page with same session (cookies preserved)
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    watch_html = session.get(watch_url, timeout=20).text
-
-    api_key_match = re.search(
-        r'"INNERTUBE_API_KEY":"([^"]+)"',
-        watch_html
+    video_id, page = get_video_id_and_page(
+        session,
+        youtube_url,
     )
-    if not api_key_match:
-        logging.error("Could not find INNERTUBE_API_KEY")
+
+    if not video_id:
+
+        logging.warning(
+            "No video ID found"
+        )
+
         return None
-    api_key = api_key_match.group(1)
 
-    visitor_data = get_visitor_data(watch_html)
+    logging.info(
+        f"Using video ID: {video_id}"
+    )
 
-    player_url = f"https://www.youtube.com/youtubei/v1/player?key={api_key}&prettyPrint=false"
+    # --------------------------------------------------------
+    # API key
+    # --------------------------------------------------------
 
-    clients = [
-        {"clientName": "ANDROID_VR", "clientVersion": "1.60.19"},
-        {"clientName": "ANDROID", "clientVersion": "20.10.38"},
-        {"clientName": "WEB_EMBEDDED_PLAYER", "clientVersion": "2.20260301.00.00"},
-    ]
+    api_key = extract_api_key(
+        page
+    )
 
-    for client in clients:
-        logging.info(f"Trying client: {client['clientName']}")
+    if api_key == DEFAULT_API_KEY:
 
-        payload = {
-            "videoId": video_id,
-            "contentCheckOk": True,
-            "racyCheckOk": True,
-            "context": {
-                "client": client,
-                "user": {"lockedSafetyMode": False}
-            }
-        }
+        logging.debug(
+            "Using default InnerTube API key"
+        )
 
-        if visitor_data:
-            payload["context"]["client"]["visitorData"] = visitor_data
+    else:
 
-        try:
-            r = session.post(player_url, json=payload, timeout=25)
-            r.raise_for_status()
-            data = r.json()
+        logging.debug(
+            "Using API key extracted from page"
+        )
 
-            hls = data.get("streamingData", {}).get("hlsManifestUrl")
-            if hls:
-                logging.info(f"Success! HLS URL from {client['clientName']}")
-                return hls
+    # --------------------------------------------------------
+    # Visitor data
+    # --------------------------------------------------------
 
-        except Exception as e:
-            logging.debug(f"Client {client['clientName']} failed: {e}")
-            continue
+    visitor_data = extract_visitor_data(
+        page
+    )
 
-    logging.error("All clients failed to get HLS URL")
+    if visitor_data:
+
+        logging.debug(
+            "Visitor data found"
+        )
+
+    # --------------------------------------------------------
+    # Player API
+    # --------------------------------------------------------
+
+    data = call_player_api(
+        session,
+        video_id,
+        api_key,
+        visitor_data,
+    )
+
+    if not data:
+
+        logging.warning(
+            "No player API response"
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # HLS
+    # --------------------------------------------------------
+
+    hls = extract_hls_from_response(
+        data
+    )
+
+    if hls:
+
+        logging.info(
+            "HLS retrieved successfully"
+        )
+
+        return hls
+
+    logging.warning(
+        "No HLS stream found"
+    )
+
     return None
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# ============================================================
+# M3U
+# ============================================================
+
 def main():
 
-    channels = parse_xml(INPUT_XML)
+    try:
 
-    with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
+        channels = parse_xml(
+            INPUT_XML
+        )
 
-        f.write("#EXTM3U\n")
+    except Exception as exc:
 
-        for ch in channels:
+        logging.error(
+            f"Failed to parse {INPUT_XML}: {exc}"
+        )
 
-            logging.info(f"--- Processing: {ch['name']} ({ch['youtube-url']}) ---")
+        return
 
-            hls = extract_youtube_stream(ch["youtube-url"])
+    exported = 0
 
-            if not hls:
-                logging.warning("Skipping channel")
+    with open(
+        OUTPUT_M3U,
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as playlist:
+
+        playlist.write(
+            "#EXTM3U\n"
+        )
+
+        for channel in channels:
+
+            logging.info(
+                f"--- Processing: "
+                f"{channel['name']} ---"
+            )
+
+            youtube_url = channel[
+                "youtube-url"
+            ]
+
+            if not youtube_url:
+
+                logging.warning(
+                    f"No YouTube URL configured "
+                    f"for {channel['name']}"
+                )
+
                 continue
 
-            f.write(
-                f'#EXTINF:-1 tvg-id="{ch["tvg-id"]}" '
-                f'tvg-name="{ch["tvg-name"]}" '
-                f'tvg-logo="{ch["tvg-logo"]}" '
-                f'group-title="{ch["group-title"]}",'
-                f'{ch["name"]}\n'
+            hls = extract_youtube_stream(
+                youtube_url
             )
-            f.write(f"{hls}\n\n")
 
-            logging.info("Added to playlist")
+            if not hls:
 
-    logging.info(f"Playlist written: {OUTPUT_M3U}")
+                logging.warning(
+                    f"Failed to find stream for "
+                    f"{channel['name']}"
+                )
 
+                continue
+
+            playlist.write(
+                f'#EXTINF:-1 '
+                f'tvg-id="{channel["tvg-id"]}" '
+                f'tvg-name="{channel["tvg-name"]}" '
+                f'tvg-logo="{channel["tvg-logo"]}" '
+                f'group-title="{channel["group-title"]}",'
+                f'{channel["name"]}\n'
+            )
+
+            playlist.write(
+                f"{hls}\n"
+            )
+
+            exported += 1
+
+            logging.info(
+                f"Successfully exported "
+                f"{channel['name']}"
+            )
+
+    logging.info(
+        f"Playlist saved: {OUTPUT_M3U} "
+        f"({exported}/{len(channels)} channels exported)"
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
